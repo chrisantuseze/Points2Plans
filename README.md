@@ -1,8 +1,8 @@
 # Points2Plans: From Point Clouds to Long-Horizon Plans with Composable Relational Dynamics 
-Code to accompany our paper: _Points2Plans: From Point Clouds to Long-Horizon Plans with Composable Relational Dynamics_. [[PDF]](https://arxiv.org/pdf/2408.14769) [[Website]](https://sites.google.com/stanford.edu/points2plans)
+Code to accompany our ICRA 2025 paper: _Points2Plans: From Point Clouds to Long-Horizon Plans with Composable Relational Dynamics_. [[PDF]](https://arxiv.org/pdf/2408.14769) [[Website]](https://sites.google.com/stanford.edu/points2plans)
 
 ## Approach Overview
-![Overview figure](images/teaser.png)
+![Overview figure](images/teaser_v1.png)
 
 This repository includes: 
 
@@ -86,10 +86,11 @@ python relational_dynamics/main.py \
 ## Citation
 If you find our work useful in your research, please cite:
 ```
-@misc{huang-2024-points2plans,
-author = {Yixuan Huang and Christopher Agia and Jimmy Wu and Tucker Hermans and Jeannette Bohg},
-title = {{Points2Plans: From Point Clouds to Long-Horizon Plans with Composable Relational Dynamics}},
-url = {sites.google.com/stanford.edu/points2plans},
-year = 2024
+@InProceedings{huang-icra2025-p2p,
+ title = {{Points2Plans: From Point Clouds to Long-Horizon Plans with Composable Relational Dynamics}},
+ author = {Yixuan Huang and Christopher Agia and Jimmy Wu and Tucker Hermans and Jeannette Bohg},
+ booktitle = {IEEE International Conference on Robotics and Automation (ICRA)},
+ year = {2025},
+ url = {https://sites.google.com/stanford.edu/points2plans}
 }
 ```
