@@ -1,3 +1,22 @@
+"""
+Relational dynamics training and planning main class.
+
+This module defines the RelationalDynamics class which orchestrates:
+ - data loading and preprocessing (via DataLoader),
+ - per-object embedding (PointConv),
+ - relational / graph dynamics (EmbeddingNetTorch),
+ - decoding/readout (QuickReadoutNet),
+ - training loop (loss computation and optimization), and
+ - a sampling-based planner that simulates actions using learned dynamics.
+
+The code expects the DataLoader to provide per-scene dicts containing
+voxelized object point-clouds, pairwise relations, actions, and poses.
+
+This file contains mainly orchestration logic; the heavy model implementations
+live in `relational_dynamics.model.models` and dataset code in
+`relational_dynamics.dataloader.dataloader`.
+"""
+
 import numpy as np
 import argparse
 import pickle
@@ -27,6 +46,17 @@ from torch.utils.tensorboard import SummaryWriter
 
 
 class RelationalDynamics(object):
+    """Main class to train and run relational dynamics models.
+
+    Responsibilities:
+    - build models and optimizers from config
+    - convert raw DataLoader outputs into packed tensors
+    - run training forward/backward passes and update weights
+    - run a sampling-based planner that uses model predictions
+
+    The constructor expects a `config` with `.args` namespace containing
+    many experiment flags (see usage throughout the file).
+    """
     def __init__(self, config):
 
         self.config = config
@@ -36,8 +66,9 @@ class RelationalDynamics(object):
         
         self.timestr = time.strftime("%Y-%m-%d-%H-%M-%S")
 
+        # Misc hyper-parameters used in parts of the codebase
         self.params = {
-            'theta_predicte_lr_fb_ab' : np.pi / args.relation_angle, # 45 degrees
+            'theta_predicte_lr_fb_ab' : np.pi / args.relation_angle, # angle normalization
             'occ_IoU_threshold' : 0.5,
         }
 
@@ -45,42 +76,42 @@ class RelationalDynamics(object):
             self.writer = SummaryWriter(log_dir = "../runs/"+self.timestr)
             self.loss_iter = 0
 
-
-
+        
+        # Lists used to accumulate or cache planning-related artifacts
         self.action_list = []
         self.goal_relation_list = []
         self.gt_extents_range_list = []
         self.gt_pose_list = []
 
-        
+        # Build DataLoader responsible for feeding scenes and next-step scenes
         self.dataloader = DataLoader(
             config,
             use_multiple_train_dataset = args.use_multiple_train_dataset,
-            use_multiple_test_dataset = args.use_multiple_test_dataset, 
-            pick_place = args.pick_place, 
+            use_multiple_test_dataset = args.use_multiple_test_dataset,
+            pick_place = args.pick_place,
             pushing = args.pushing,
-            stacking = True, 
-            set_max = args.set_max, 
+            stacking = True,
+            set_max = args.set_max,
             max_objects = args.max_objects,
             online_planning = args.online_planning,
-            start_id = args.start_id, 
-            max_size = args.max_size, 
-            start_test_id = args.start_test_id, 
+            start_id = args.start_id,
+            max_size = args.max_size,
+            start_test_id = args.start_test_id,
             test_max_size = args.test_max_size,
             updated_behavior_params = args.updated_behavior_params,
             save_data_path = args.save_data_path,
-            evaluate_new = args.evaluate_new, 
+            evaluate_new = args.evaluate_new,
             evaluate_pickplace = args.evaluate_pickplace,
             using_multi_step_statistics = args.using_multi_step_statistics,
             total_multi_steps = args.total_sub_step,
             use_shared_latent_embedding = args.use_shared_latent_embedding,
             use_seperate_latent_embedding = args.use_seperate_latent_embedding,
             push_3_steps = args.push_3_steps,
-            POMDP_push = args.POMDP_push, 
-            sudo_pickplace = args.sudo_pickplace, 
-            push_steps = args.push_steps, 
-            single_step_training = args.single_step_training, 
-            add_noise_pc = args.add_noise_pc, 
+            POMDP_push = args.POMDP_push,
+            sudo_pickplace = args.sudo_pickplace,
+            push_steps = args.push_steps,
+            single_step_training = args.single_step_training,
+            add_noise_pc = args.add_noise_pc,
             train_object_identity = args.train_object_identity,
             use_rgb = args.use_rgb,
             use_boundary_relations = args.use_boundary_relations,
@@ -92,95 +123,96 @@ class RelationalDynamics(object):
             fast_training = args.fast_training,
             one_bit_env = args.one_bit_env,
             rcpe = args.rcpe,
-            pe = args.pe, 
+            pe = args.pe,
             relation_angle = args.relation_angle,
             bookshelf_env_shift = args.bookshelf_env_shift,
             lfd_search = args.lfd_search,
             get_hidden_label = args.get_hidden_label,
             get_inside_relations = args.get_inside_relations,
             enable_place_inside = args.enable_place_inside,
-            binary_grasp = args.binary_grasp, 
-            open_close_drawer = args.open_close_drawer, 
-            softmax_identity = args.softmax_identity, 
-            train_inside_feasibility = args.train_inside_feasibility, 
-            use_discrete_place = args.use_discrete_place, 
-            seperate_place = args.seperate_place, 
+            binary_grasp = args.binary_grasp,
+            open_close_drawer = args.open_close_drawer,
+            softmax_identity = args.softmax_identity,
+            train_inside_feasibility = args.train_inside_feasibility,
+            use_discrete_place = args.use_discrete_place,
+            seperate_place = args.seperate_place,
             enable_leap_num = args.enable_leap_num,
             batch_feasibility = args.batch_feasibility
-            )
-        
-                
-           
+        )
+
         args = config.args
-        
+
+        # Per-object point-cloud encoder -> produces per-object embeddings
         self.emb_model = PointConv(normal_channel=False, use_rgb = args.use_rgb, output_dim = args.node_emb_size)
 
-
+        # Core relational/graph/dynamics model. This module provides:
+        # - one_hot_encoding_embed(...)
+        # - continuous_action_emb / continuous_action_emb_1
+        # - graph_dynamics_0 / graph_dynamics_1 (two skill-dependent dynamics)
         self.classif_model = EmbeddingNetTorch(n_objects = args.max_objects,
-                                width = args.node_emb_size*2, 
-                                layers = args.n_layers, 
-                                heads = args.n_heads, 
-                                input_feature_num = args.max_objects + 3,
-                                d_hidden = args.d_hidden, 
-                                n_unary = args.max_objects + 3, 
-                                n_binary = args.z_dim,
-                                simple_encoding = args.simple_encoding,
-                                transformer_dynamics = args.transformer_dynamics,
-                                seperate_discrete_continuous = args.seperate_discrete_continuous,
-                                torch_embedding = args.torch_embedding,
-                                complicated_pre_dynamics = args.complicated_pre_dynamics,
-                                direct_transformer = args.direct_transformer,
-                                enable_high_push = args.enable_high_push,
-                                enable_place_inside = args.enable_place_inside, 
-                                use_discrete_place = args.use_discrete_place,
-                                latent_discrete_continuous = args.latent_discrete_continuous, 
-                                seperate_place = args.seperate_place,
-                                use_seperate_latent_embedding = args.use_seperate_latent_embedding,
-                                seperate_action_emb = args.seperate_action_emb,
-                                dim_feedforward = args.dim_feedforward,
-                                use_mlp_encoder = args.use_mlp_encoder, 
-                                )
-        
+                                    width = args.node_emb_size*2,
+                                    layers = args.n_layers,
+                                    heads = args.n_heads,
+                                    input_feature_num = args.max_objects + 3,
+                                    d_hidden = args.d_hidden,
+                                    n_unary = args.max_objects + 3,
+                                    n_binary = args.z_dim,
+                                    simple_encoding = args.simple_encoding,
+                                    transformer_dynamics = args.transformer_dynamics,
+                                    seperate_discrete_continuous = args.seperate_discrete_continuous,
+                                    torch_embedding = args.torch_embedding,
+                                    complicated_pre_dynamics = args.complicated_pre_dynamics,
+                                    direct_transformer = args.direct_transformer,
+                                    enable_high_push = args.enable_high_push,
+                                    enable_place_inside = args.enable_place_inside,
+                                    use_discrete_place = args.use_discrete_place,
+                                    latent_discrete_continuous = args.latent_discrete_continuous,
+                                    seperate_place = args.seperate_place,
+                                    use_seperate_latent_embedding = args.use_seperate_latent_embedding,
+                                    seperate_action_emb = args.seperate_action_emb,
+                                    dim_feedforward = args.dim_feedforward,
+                                    use_mlp_encoder = args.use_mlp_encoder,
+                                    )
+
+        # Decoder / readout network producing predicates, poses and feasibility
         self.classif_model_decoder = QuickReadoutNet(n_objects = args.max_objects,
-                            width = args.node_emb_size*2, 
-                            layers = args.n_layers, 
-                            heads = args.n_heads, 
+                            width = args.node_emb_size*2,
+                            layers = args.n_layers,
+                            heads = args.n_heads,
                             input_feature_num = args.max_objects + 3,
-                            d_hidden = args.d_hidden, 
-                            n_unary = args.max_objects + 3, 
+                            d_hidden = args.d_hidden,
+                            n_unary = args.max_objects + 3,
                             n_binary = args.z_dim,
-                            pose_num = args.pose_num, 
+                            pose_num = args.pose_num,
                             train_env_identity = args.train_env_identity,
-                            train_grasp_identity = args.train_grasp_identity, 
-                            train_inside_feasibility = args.train_inside_feasibility, 
-                            binary_grasp = args.binary_grasp, 
-                            open_close_drawer = args.open_close_drawer, 
-                            softmax_identity = args.softmax_identity, 
-                            seperate_identity = args.seperate_identity, 
+                            train_grasp_identity = args.train_grasp_identity,
+                            train_inside_feasibility = args.train_inside_feasibility,
+                            binary_grasp = args.binary_grasp,
+                            open_close_drawer = args.open_close_drawer,
+                            softmax_identity = args.softmax_identity,
+                            seperate_identity = args.seperate_identity,
                             one_bit_env = args.one_bit_env,
                             pe = args.pe,
                             train_obj_move = args.train_obj_move,
-                            train_obj_boundary = args.train_obj_boundary, 
+                            train_obj_boundary = args.train_obj_boundary,
                             transformer_decoder = args.transformer_decoder,
                             remove_orientation = args.remove_orientation,
                             pose_trans_decoder = args.pose_trans_decoder,
                             dim_feedforward = args.dim_feedforward)
-    
 
-        
 
+        # Optimizers for each part of the network
         self.opt_emb = optim.Adam(self.emb_model.parameters(), lr=args.emb_lr)
-        
-        self.opt_classif = optim.Adam(self.classif_model.parameters(), lr=args.learning_rate) 
-        self.opt_classif_decoder = optim.Adam(self.classif_model_decoder.parameters(), lr=args.learning_rate) 
-        
+        self.opt_classif = optim.Adam(self.classif_model.parameters(), lr=args.learning_rate)
+        self.opt_classif_decoder = optim.Adam(self.classif_model_decoder.parameters(), lr=args.learning_rate)
 
+        # Loss functions used in training
         self.dynamics_loss = nn.MSELoss()
         self.sum_dyna_loss = nn.L1Loss()
-        
         self.bce_loss = nn.BCELoss()
 
     def mySqrtLoss (self, distance):
+        # custom-scaled sqrt loss used for pose errors
         return  self.args.sqrt_var * torch.sqrt(12*distance)
        
     def get_model_list(self):
@@ -197,6 +229,117 @@ class RelationalDynamics(object):
         model_list = self.get_model_list()
         for m in model_list:
             m.to(device)
+
+    def _compute_time_step_outputs(self, x_tensor_dict, total_steps):
+        """Compute embeddings and decoder outputs for each time step.
+
+        Returns the lists used by training for dynamics targets and losses.
+        """
+        current_latent_list = []
+        current_output_classifier_list = []
+        current_output_pose_list = []
+        current_env_identity_list = []
+        current_grasp_identity_list = []
+
+        for this_step in range(total_steps):
+            voxel_data_single = x_tensor_dict['batch_voxel_list_single'][:, this_step, :, : ,:]
+            reshaped_voxel_data_single = voxel_data_single.reshape(voxel_data_single.shape[0]*voxel_data_single.shape[1], voxel_data_single.shape[2], voxel_data_single.shape[3])
+            img_emb_single = self.emb_model(reshaped_voxel_data_single)
+            img_emb_single = img_emb_single.reshape(voxel_data_single.shape[0], voxel_data_single.shape[1], img_emb_single.shape[1])
+
+            one_hot_encoding_tensor = x_tensor_dict['batch_one_hot_encoding']
+            latent_one_hot_encoding = self.classif_model.one_hot_encoding_embed(torch.argmax(one_hot_encoding_tensor, dim = 2))
+
+            node_pose = torch.cat([img_emb_single, latent_one_hot_encoding], dim = -1)
+
+            outs_decoder = self.classif_model_decoder(node_pose, self.edge_index)
+
+            current_latent_list.append([node_pose])
+            current_output_classifier_list.append(outs_decoder['pred_sigmoid'][:])
+            current_output_pose_list.append(outs_decoder['predicted_pose'][:])
+            current_env_identity_list.append(outs_decoder['env_identity'][:])
+            current_grasp_identity_list.append(outs_decoder['grasp_identity'][:])
+
+        return (current_latent_list, current_output_classifier_list, current_output_pose_list,
+                current_env_identity_list, current_grasp_identity_list)
+
+    def _get_action_embeddings(self, x_tensor_dict, seq, current_latent_list):
+        """Build discrete and continuous action embeddings for training dynamics.
+
+        Returns current_latent, discrete_action, continuous_action,
+        current_action_continuous, current_action, skill_label
+        """
+        action_torch = x_tensor_dict['batch_action'][:, seq]
+        skill_label = x_tensor_dict['batch_skill_label'][:, seq]
+
+        current_latent = current_latent_list[0][0]
+
+        # discrete action embedding
+        discrete_action = self.classif_model.one_hot_encoding_embed(torch.argmax(action_torch[:, 0, 1:-3], dim = -1))
+        discrete_action = discrete_action.view(discrete_action.shape[0], 1, discrete_action.shape[1])
+
+        # continuous action depends on skill label
+        continuous_action = []
+        for batch_id in range(discrete_action.shape[0]):
+            if skill_label[batch_id] == 0:
+                continuous_action.append(self.classif_model.continuous_action_emb(action_torch[batch_id, 0, -3:-1]))
+            elif skill_label[batch_id] == 1:
+                continuous_action.append(self.classif_model.continuous_action_emb_1(action_torch[batch_id, 0, -3:-1]))
+        continuous_action = torch.stack(continuous_action)
+        continuous_action = continuous_action.view(continuous_action.shape[0], 1, continuous_action.shape[1])
+
+        current_action_continuous = torch.cat((discrete_action, continuous_action), axis = -1)
+
+        # compute place id embedding (either from support_suface_id or buffer tensor)
+        discrete_place_id_tensor = []
+        for batch_id in range(discrete_action.shape[0]):
+            if x_tensor_dict['support_suface_id'][batch_id][seq].shape[0] == 1 and x_tensor_dict['support_suface_id'][batch_id][seq].shape[1] >= 1:
+                assert x_tensor_dict['support_suface_id'][batch_id][seq][0][0] == x_tensor_dict['support_suface_id'][batch_id][seq][0][1]
+                discrete_place_id = x_tensor_dict['support_suface_id'][batch_id][seq][0][0]
+                discrete_place_id_tensor.append(self.classif_model.one_hot_encoding_embed(discrete_place_id))
+            else:
+                discrete_place_id_tensor.append(x_tensor_dict['buffer_tensor_0'][batch_id][seq][0])
+
+        discrete_place_id_tensor = torch.stack(discrete_place_id_tensor)
+        discrete_place_id_tensor = discrete_place_id_tensor.view(discrete_place_id_tensor.shape[0], 1, discrete_place_id_tensor.shape[1])
+
+        current_action = torch.cat((discrete_place_id_tensor, continuous_action), axis = -1)
+
+        return current_latent, discrete_action, continuous_action, current_action_continuous, current_action, skill_label
+
+    def _build_masks(self, x_tensor_dict):
+        """Construct commonly used masks for training loss computation.
+
+        Returns a dict with masks keyed by name.
+        """
+        masks = {}
+        masks['relational_mask'] = (x_tensor_dict['batch_all_obj_pair_relation']==-1)
+        masks['env_mask'] = (x_tensor_dict['batch_env_identity']==-1)
+        masks['object_level_mask'] = masks['env_mask'][:, :, :, [0]]
+        masks['latent_space_mask'] = masks['object_level_mask'].repeat(1,1,1,256)
+        masks['graspable_mask'] = (x_tensor_dict['batch_grasp_identity']==-1)
+        masks['position_mask'] = (x_tensor_dict['batch_6DOF_pose']==-1)
+        return masks
+
+    def _compute_losses(self, current_output_classifier_list, current_env_identity_list, current_grasp_identity_list, pred_latent, current_latent_list, predicted_pose, predicted_predicates, predicted_env, predicted_feasibility, x_tensor_dict):
+        """Compute and return the total loss using internal loss functions and masks.
+
+        This helper mirrors the previous inline loss computation.
+        """
+        masks = self._build_masks(x_tensor_dict)
+        total_loss = 0
+        for i in range(len(current_output_classifier_list)):
+            total_loss += self.bce_loss(current_output_classifier_list[i][~masks['relational_mask'][i]], x_tensor_dict['batch_all_obj_pair_relation'][i][~masks['relational_mask'][i]])
+            total_loss += self.bce_loss(current_env_identity_list[i][~masks['env_mask'][i]], x_tensor_dict['batch_env_identity'][i][~masks['env_mask'][i]])
+            total_loss += self.bce_loss(current_grasp_identity_list[i][~masks['graspable_mask'][i]], x_tensor_dict['batch_grasp_identity'][i][~masks['graspable_mask'][i]])
+
+        total_loss += self.dynamics_loss(pred_latent[~masks['latent_space_mask'][1]], current_latent_list[1][0][~masks['latent_space_mask'][1]])
+        total_loss += self.mySqrtLoss(self.sum_dyna_loss(predicted_pose[~masks['position_mask'][1]] + x_tensor_dict['batch_6DOF_pose'][0][~masks['position_mask'][1]], x_tensor_dict['batch_6DOF_pose'][1][~masks['position_mask'][1]]))
+        total_loss += self.bce_loss(predicted_predicates[~masks['relational_mask'][1]], x_tensor_dict['batch_all_obj_pair_relation'][1][~masks['relational_mask'][1]])
+        total_loss += self.bce_loss(predicted_env[~masks['env_mask'][i]], x_tensor_dict['batch_env_identity'][1][~masks['env_mask'][i]])
+        total_loss += self.bce_loss(predicted_feasibility[~masks['graspable_mask'][1]], x_tensor_dict['batch_grasp_identity'][1][~masks['graspable_mask'][1]])
+
+        return total_loss
     
     def model_checkpoint_dir(self):
         '''Return the directory to save models in.'''
@@ -219,7 +362,14 @@ class RelationalDynamics(object):
         self.classif_model_decoder.load_state_dict(cp_models['classif_model_decoder'])
 
     def process_data(self, batch_data, push_3_steps = False): 
-        '''Process raw batch data and collect relevant objects in a dict.'''
+        '''Process raw batch data and collect relevant objects in a dict.
+
+        Input: batch_data is a list of per-scene dicts produced by the DataLoader.
+        Output: x_dict contains tensors organized for training: stacked along
+        batch dimension (and sequence/time dimension where applicable).
+        Values set to -1 in the data indicate masked / missing entries and are
+        respected later during loss computation.
+        '''
         args = self.config.args
         x_dict = dict()
 
@@ -238,6 +388,10 @@ class RelationalDynamics(object):
         x_dict['support_suface_id'] = []
         x_dict['buffer_tensor_0'] = []
 
+        # Stack items from every element in batch_data into lists, then convert
+        # to tensors (or keep as lists where appropriate). The DataLoader
+        # already formats keys like 'all_object_pair_voxels_single' so we keep
+        # the same naming and shapes expected by downstream code.
         for b, data in enumerate(batch_data):
             x_dict['batch_num_objects'].append(data['num_objects'])
             x_dict['batch_action'].append(data['action'])
@@ -258,7 +412,8 @@ class RelationalDynamics(object):
             x_dict['support_suface_id'].append(data['support_suface_id'])
             x_dict['buffer_tensor_0'].append(data['buffer_tensor_0'])
             x_dict['batch_all_hidden_label'] = data['all_hidden_label']
-            
+
+        # Convert lists to stacked tensors for efficient batch processing
         x_dict['batch_env_identity'] = torch.squeeze(torch.stack(x_dict['batch_env_identity']), 1)
         x_dict['batch_all_obj_pair_relation'] = torch.squeeze(torch.stack(x_dict['batch_all_obj_pair_relation']), 1)
         x_dict['batch_voxel_list_single'] = torch.squeeze(torch.stack(x_dict['batch_voxel_list_single']), 1)
@@ -267,15 +422,19 @@ class RelationalDynamics(object):
         x_dict['batch_one_hot_encoding'] = torch.squeeze(torch.stack(x_dict['batch_one_hot_encoding']), 1)
         x_dict['batch_grasp_identity'] = torch.squeeze(torch.stack(x_dict['batch_grasp_identity']), 1)
         x_dict['batch_6DOF_pose'] = torch.squeeze(torch.stack(x_dict['batch_6DOF_pose']), 1)
-        
+
         return x_dict
 
     def process_data_plan(self, batch_data, push_3_steps = False): 
-        '''Process raw batch data and collect relevant objects in a dict.'''
+        '''Process data for planning (assumes batch size == 1).
+
+        This is similar to `process_data` but keeps a single scene and does not
+        stack across a batch dimension. The planner expects single-scene input.
+        '''
         args = self.config.args
         x_dict = dict()
 
-        
+        # Planner operates on single-scene inputs
         assert(len(batch_data) == 1)
 
         for b, data in enumerate(batch_data):
@@ -302,7 +461,6 @@ class RelationalDynamics(object):
 
             x_dict['batch_all_hidden_label'] = data['all_hidden_label']
 
-            
         return x_dict
 
     def training(self,
@@ -311,36 +469,39 @@ class RelationalDynamics(object):
                 batch_size,
                 train=False,
                 threshold = 0):
-
+        # Main training function called by RD() per batch
         batch_result_dict = {}
         device = self.config.get_device()
 
-        total_steps = x_tensor_dict['batch_all_obj_pair_relation'].shape[1] 
+        # sequence length (number of time steps) for this batch
+        total_steps = x_tensor_dict['batch_all_obj_pair_relation'].shape[1]
 
-        self.num_nodes = x_tensor_dict['batch_num_objects'] 
+        self.num_nodes = x_tensor_dict['batch_num_objects']
 
         current_latent_list = []
         current_output_classifier_list = []
         current_output_pose_list = []
         current_env_identity_list = []
         current_grasp_identity_list = []
-        
-        
-        x_tensor_dict['batch_all_obj_pair_relation'] = x_tensor_dict['batch_all_obj_pair_relation'] 
 
+        x_tensor_dict['batch_all_obj_pair_relation'] = x_tensor_dict['batch_all_obj_pair_relation']
+
+        # edge_index (graph connectivity) is provided by the dataloader
         self.edge_index = x_tensor_dict['batch_edge_attr']
 
+        # transpose to have time/sequence dimension first: (T, batch, ...)
         x_tensor_dict['batch_all_obj_pair_relation'] = torch.transpose(x_tensor_dict['batch_all_obj_pair_relation'], 0, 1)
-        
         x_tensor_dict['batch_grasp_identity'] = torch.transpose(x_tensor_dict['batch_grasp_identity'], 0, 1)
-        
         x_tensor_dict['batch_6DOF_pose'] = torch.transpose(x_tensor_dict['batch_6DOF_pose'], 0, 1)
+        # only keep x,y for some parts of the code (z handled separately)
         x_tensor_dict['batch_6DOF_pose'] = x_tensor_dict['batch_6DOF_pose'][:, :, :, :2]
-        
         x_tensor_dict['batch_env_identity'] = torch.transpose(x_tensor_dict['batch_env_identity'], 0, 1)
-        
+
+        # Construct padding mask where env identity is -1 (invalid/missing nodes)
         self.src_key_padding_mask = (x_tensor_dict['batch_env_identity'][:, :, :, 0]==-1)
         
+        # Ensure at least one node is not fully masked per sequence element so
+        # transformer/graph modules don't receive an all-masked input row.
         for each_i in range(self.src_key_padding_mask.shape[0]):
             for each_j in range(self.src_key_padding_mask.shape[1]):
                 if torch.all(self.src_key_padding_mask[each_i][each_j]):
@@ -351,71 +512,24 @@ class RelationalDynamics(object):
         self.dynamic_src_padding_mask[:,:,:-2] = self.src_key_padding_mask
 
 
-        for this_step in range(total_steps):
-            voxel_data_single = x_tensor_dict['batch_voxel_list_single'][:, this_step, :, : ,:]
-            reshaped_voxel_data_single = voxel_data_single.reshape(voxel_data_single.shape[0]*voxel_data_single.shape[1], voxel_data_single.shape[2], voxel_data_single.shape[3])
-            img_emb_single = self.emb_model(reshaped_voxel_data_single)
-            img_emb_single = img_emb_single.reshape(voxel_data_single.shape[0], voxel_data_single.shape[1], img_emb_single.shape[1])
-            
+        # Compute per-time-step embeddings and decoder outputs (helper)
+        (current_latent_list,
+         current_output_classifier_list,
+         current_output_pose_list,
+         current_env_identity_list,
+         current_grasp_identity_list) = self._compute_time_step_outputs(x_tensor_dict, total_steps)
 
-            one_hot_encoding_tensor = x_tensor_dict['batch_one_hot_encoding'] 
-            latent_one_hot_encoding = self.classif_model.one_hot_encoding_embed(torch.argmax(one_hot_encoding_tensor, dim = 2))
-            
-            node_pose = torch.cat([img_emb_single, latent_one_hot_encoding], dim = -1)
-
-            
-            outs_decoder = self.classif_model_decoder(node_pose, self.edge_index)
-
-            current_latent_list.append([node_pose])
-
-            current_output_classifier_list.append(outs_decoder['pred_sigmoid'][:])
-
-            current_output_pose_list.append(outs_decoder['predicted_pose'][:])
-            
-            current_env_identity_list.append(outs_decoder['env_identity'][:]) 
-
-            current_grasp_identity_list.append(outs_decoder['grasp_identity'][:]) 
-
-        seq = 0 
-        
-        action_torch = x_tensor_dict['batch_action'][:, seq]
-        skill_label = x_tensor_dict['batch_skill_label'][:, seq]
-            
-        current_latent = current_latent_list[0][0]
-        
-        discrete_action = self.classif_model.one_hot_encoding_embed(torch.argmax(action_torch[:, 0, 1:-3], dim = -1))
-        discrete_action = discrete_action.view(discrete_action.shape[0], 1, discrete_action.shape[1])
-
-        continuous_action = []
-        for batch_id in range(discrete_action.shape[0]):
-            if skill_label[batch_id] == 0:
-                continuous_action.append(self.classif_model.continuous_action_emb(action_torch[batch_id, 0, -3:-1])) 
-            elif skill_label[batch_id] == 1:
-                continuous_action.append(self.classif_model.continuous_action_emb_1(action_torch[batch_id, 0, -3:-1]))
-        continuous_action = torch.stack(continuous_action)
-        continuous_action = continuous_action.view(continuous_action.shape[0], 1, continuous_action.shape[1])
-        
-        
-        current_action_continuous = torch.cat((discrete_action, continuous_action), axis = -1)
-
-        discrete_place_id_tensor = []
-        for batch_id in range(discrete_action.shape[0]):
-            if x_tensor_dict['support_suface_id'][batch_id][seq].shape[0] == 1 and x_tensor_dict['support_suface_id'][batch_id][seq].shape[1] >= 1:
-                assert x_tensor_dict['support_suface_id'][batch_id][seq][0][0] == x_tensor_dict['support_suface_id'][batch_id][seq][0][1]
-                discrete_place_id = x_tensor_dict['support_suface_id'][batch_id][seq][0][0]
-                discrete_place_id_tensor.append(self.classif_model.one_hot_encoding_embed(discrete_place_id))
-            else:  
-                discrete_place_id_tensor.append(x_tensor_dict['buffer_tensor_0'][batch_id][seq][0])
-        
-        discrete_place_id_tensor = torch.stack(discrete_place_id_tensor)
-        discrete_place_id_tensor = discrete_place_id_tensor.view(discrete_place_id_tensor.shape[0], 1, discrete_place_id_tensor.shape[1])
-        
-        current_action = torch.cat((discrete_place_id_tensor, continuous_action), axis = -1)
+        # For training we use the first sequence element (seq=0) to compute
+        # action-conditioned dynamics predictions (helper builds embeddings)
+        seq = 0
+        (current_latent, discrete_action, continuous_action, current_action_continuous,
+         current_action, skill_label) = self._get_action_embeddings(x_tensor_dict, seq, current_latent_list)
 
 
+        # Concatenate node latents with action features to form graph node inputs
         graph_node_action = torch.cat((current_latent, current_action_continuous, current_action), axis = 1)
 
-        
+        # Run skill-conditioned dynamics per-batch element and collect next-latent
         current_latent = []
         for batch_id in range(discrete_action.shape[0]):
             if skill_label[batch_id] == 0:
@@ -423,14 +537,16 @@ class RelationalDynamics(object):
             elif skill_label[batch_id] == 1:
                 current_latent.append(self.classif_model.graph_dynamics_1(graph_node_action[batch_id], src_key_padding_mask = self.dynamic_src_padding_mask[0][batch_id]))
         current_latent = torch.stack(current_latent)
-        
+
+        # Optionally predict delta in latent space (delta_forward) or absolute next latent
         if self.config.args.delta_forward:
             delta_latent = current_latent[:, :-2, :]
-            pred_latent = delta_latent + current_latent_list[0][0] 
+            pred_latent = delta_latent + current_latent_list[0][0]
         else:
             pred_latent = current_latent[:, :-2, :]
-        
-        outs_decoder_2_edge = self.classif_model_decoder(pred_latent, self.edge_index) 
+
+        # Decode predictions from predicted latent
+        outs_decoder_2_edge = self.classif_model_decoder(pred_latent, self.edge_index)
         predicted_predicates = outs_decoder_2_edge['pred_sigmoid'][:]
 
         if self.config.args.delta_forward:
@@ -441,31 +557,14 @@ class RelationalDynamics(object):
         predicted_env = outs_decoder_2_edge['env_identity'][:]
         predicted_feasibility = outs_decoder_2_edge['grasp_identity'][:]
 
-        total_loss = 0
+        # Compute total loss via helper to keep training method concise
+        total_loss = self._compute_losses(
+            current_output_classifier_list, current_env_identity_list, current_grasp_identity_list,
+            pred_latent, current_latent_list, predicted_pose, predicted_predicates, predicted_env,
+            predicted_feasibility, x_tensor_dict
+        )
 
-        relational_mask = (x_tensor_dict['batch_all_obj_pair_relation']==-1)
-        
-        env_mask = (x_tensor_dict['batch_env_identity']==-1)
-
-        object_level_mask = env_mask[:, :, :, [0]]
-
-        latent_space_mask = object_level_mask.repeat(1,1,1,256)
-        
-
-        graspable_mask = (x_tensor_dict['batch_grasp_identity']==-1)
-        position_mask = (x_tensor_dict['batch_6DOF_pose']==-1)
-        
-        for i in range(len(current_output_classifier_list)):            
-            total_loss += self.bce_loss(current_output_classifier_list[i][~relational_mask[i]], x_tensor_dict['batch_all_obj_pair_relation'][i][~relational_mask[i]])
-            total_loss += self.bce_loss(current_env_identity_list[i][~env_mask[i]], x_tensor_dict['batch_env_identity'][i][~env_mask[i]])
-            total_loss += self.bce_loss(current_grasp_identity_list[i][~graspable_mask[i]], x_tensor_dict['batch_grasp_identity'][i][~graspable_mask[i]])
-
-        total_loss += self.dynamics_loss(pred_latent[~latent_space_mask[1]], current_latent_list[1][0][~latent_space_mask[1]])
-        total_loss += self.mySqrtLoss(self.sum_dyna_loss(predicted_pose[~position_mask[1]] + x_tensor_dict['batch_6DOF_pose'][0][~position_mask[1]], x_tensor_dict['batch_6DOF_pose'][1][~position_mask[1]]))
-        total_loss += self.bce_loss(predicted_predicates[~relational_mask[1]], x_tensor_dict['batch_all_obj_pair_relation'][1][~relational_mask[1]])  
-        total_loss += self.bce_loss(predicted_env[~env_mask[i]], x_tensor_dict['batch_env_identity'][1][~env_mask[i]])
-        total_loss += self.bce_loss(predicted_feasibility[~graspable_mask[1]], x_tensor_dict['batch_grasp_identity'][1][~graspable_mask[1]])
-
+        # Backpropagate and update parameters
         with torch.autograd.set_detect_anomaly(True):
             self.opt_emb.zero_grad()
             self.opt_classif.zero_grad()
@@ -488,6 +587,7 @@ class RelationalDynamics(object):
         bbox2_top = bounding_box_2[0][1]
         bbox2_bottom = bounding_box_2[1][1]
 
+        # standard axis-aligned bbox overlap check
         if (bbox1_left < bbox2_right and
             bbox1_right > bbox2_left and
             bbox1_top < bbox2_bottom and
@@ -497,6 +597,7 @@ class RelationalDynamics(object):
             return False
     
     def planner(self):
+        # This helper performs the sampling-based planning and simulation loop
         device = self.device
         action_selections = self.args.planning_batch_size
         
@@ -506,14 +607,14 @@ class RelationalDynamics(object):
             if self.env_identity[each_env_id, 0] > 0.5 or self.env_identity[each_env_id, 1] > 0.5 or self.env_identity[each_env_id, 2] > 0.5:
                 obj_select_range.append(each_env_id)
 
+        # Simple, hard-coded short task templates (from experiments) used to
+        # instantiate candidate action sequences for the planner. These are
+        # small task plans e.g. [skill_type, move_obj_id, place_obj_id].
         if self.num_nodes == 5:
-            # cached task plans for packing three objects based on the output of LLMs.
             self.task_planner = [[0, 0, 3], [0, 1, 3], [0, 2, 3]]
         elif self.num_nodes == 6:
-            # cached task plans for packing four objects based on the output of LLMs.
-            self.task_planner = [[0, 0, 4], [0, 1, 4], [0, 2, 4], [0, 3, 4]]   
+            self.task_planner = [[0, 0, 4], [0, 1, 4], [0, 2, 4], [0, 3, 4]]
         elif self.num_nodes == 7:
-            # cached task plans for packing five objects based on the output of LLMs.
             self.task_planner = [[0, 0, 5], [0, 1, 5], [0, 2, 5], [0, 3, 5], [0, 4, 5]]
         
         start_time = time.time()
