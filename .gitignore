@@ -56,3 +56,4 @@ test_scenes/
 *.pickle
 *.pth
 __pycache__/
+commands.txt
