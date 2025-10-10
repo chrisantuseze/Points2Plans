@@ -57,3 +57,4 @@ test_scenes/
 *.pth
 __pycache__/
 commands.txt
+*.pdf

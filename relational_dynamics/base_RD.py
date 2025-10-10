@@ -575,26 +575,25 @@ class RelationalDynamics(object):
                     current_latent = self.this_time_step_embed
 
                     
-                    if True:
-                        if self.args.seperate_discrete_continuous:
-                            discrete_action = self.classif_model.one_hot_encoding_embed(torch.argmax(all_action_tensor[seq][:, 1:-3], dim = 1))
-                            
-                            if skill_iter == 0:
-                                continuous_action = self.classif_model.continuous_action_emb(all_action_tensor[seq][:, -3:-1])
-                            elif skill_iter == 1:
-                                continuous_action = self.classif_model.continuous_action_emb_1(all_action_tensor[seq][:, -3:-1])
+                    if self.args.seperate_discrete_continuous:
+                        discrete_action = self.classif_model.one_hot_encoding_embed(torch.argmax(all_action_tensor[seq][:, 1:-3], dim = 1))
                         
-                            current_action_continuous = torch.cat((discrete_action, continuous_action), axis = -1)
-                            if place_id == obj_mov:
-                                discrete_place_id_tensor = torch.zeros(discrete_action.shape[0], discrete_action.shape[1]).to(device)
-                                
-                                current_action = torch.cat((discrete_place_id_tensor, continuous_action), axis = -1)
-                            else:
-                                discrete_place_id_numpy = np.zeros((discrete_action.shape[0], ))
-                                discrete_place_id_numpy[:] = place_id
-                                discrete_place_id = torch.Tensor(discrete_place_id_numpy).type(torch.int64).to(device)
-                                discrete_place_id_tensor = self.classif_model.one_hot_encoding_embed(discrete_place_id)
-                                current_action = torch.cat((discrete_place_id_tensor, continuous_action), axis = -1)
+                        if skill_iter == 0:
+                            continuous_action = self.classif_model.continuous_action_emb(all_action_tensor[seq][:, -3:-1])
+                        elif skill_iter == 1:
+                            continuous_action = self.classif_model.continuous_action_emb_1(all_action_tensor[seq][:, -3:-1])
+                    
+                        current_action_continuous = torch.cat((discrete_action, continuous_action), axis = -1)
+                        if place_id == obj_mov:
+                            discrete_place_id_tensor = torch.zeros(discrete_action.shape[0], discrete_action.shape[1]).to(device)
+                            
+                            current_action = torch.cat((discrete_place_id_tensor, continuous_action), axis = -1)
+                        else:
+                            discrete_place_id_numpy = np.zeros((discrete_action.shape[0], ))
+                            discrete_place_id_numpy[:] = place_id
+                            discrete_place_id = torch.Tensor(discrete_place_id_numpy).type(torch.int64).to(device)
+                            discrete_place_id_tensor = self.classif_model.one_hot_encoding_embed(discrete_place_id)
+                            current_action = torch.cat((discrete_place_id_tensor, continuous_action), axis = -1)
 
                     current_action = current_action.view(current_action.shape[0], 1, current_action.shape[1])
                     current_action_continuous = current_action_continuous.view(current_action_continuous.shape[0], 1, current_action_continuous.shape[1])

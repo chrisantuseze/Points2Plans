@@ -13,8 +13,32 @@ from relational_dynamics.utils.other_util import LinearBlock, MLP, rotate_2d
 from relational_dynamics.utils.data_utils import scale_min_max
 from relational_dynamics.utils import torch_util
 
+# This module provides data-loading utilities for the Relational Dynamics
+# project. It defines two main components:
+# - PerSceneLoader: low-level reader/processor for a single recorded scene
+#   (converts raw pickled traces into arrays/tensors used by the models),
+# - DataLoader: higher-level manager that composes PerSceneLoader instances
+#   and provides batching/scene sampling APIs used by training and planning.
+
+# The code intentionally keeps many preprocessing options configurable
+# (e.g. push vs pick-place, discrete place encoding, environment flags)
+# because different experiments in the paper toggle these behaviors.
+
 
 class PerSceneLoader(object):
+    """
+    Loader and preprocessor for a single scene file (pickle).
+
+    Responsibilities:
+    - load a single recorded scene (positions, point clouds, contacts, attrs)
+    - compute per-object bounding boxes, axis-aligned extents, and center points
+    - build per-time-step structures used by the higher-level DataLoader
+
+    Many boolean flags control exactly which tensors are computed and how
+    relations / environment identities are encoded. The class purpose is to
+    centralize scene-specific preprocessing so the network's training loop
+    can work with fixed shape tensors.
+    """
     def __init__(self,  
                  scene_path, 
                  scene_type, 
@@ -118,6 +142,13 @@ class PerSceneLoader(object):
         self.train_inside_feasibility = train_inside_feasibility
         self.use_discrete_place = use_discrete_place
         self.seperate_place = seperate_place
+
+    # Above: summary of configuration flags passed from DataLoader/experiment
+    # Most of the remaining __init__ simply converts the pickled scene
+    # into arrays and per-time-step lists. We intentionally avoid heavy
+    # comments on every tiny flag here; instead key sections below are
+    # annotated where critical computations happen (bounding boxes,
+    # contact arrays, one-hot encodings, voxel/point-cloud loading).
 
 
         with open(self.scene_path, 'rb') as f:
@@ -258,12 +289,21 @@ class PerSceneLoader(object):
 
             
 
+            # Build a symmetric contact matrix for this time-step if contact
+            # information exists in the pickled scene. The contact matrix is
+            # total_objects x total_objects where entry (i,j)=1 means objects i
+            # and j were in contact at this timestep. Later code may use this
+            # to augment relation predicates or to mask impossible relations.
             if True:
                 if 'contact' in data:  
                     contact_array = np.zeros((total_objects, total_objects))
 
                     time_step = self.sample_time_step[i]
                     for contact_i in range(len(data['contact'][time_step])):
+                        # Some recorded scenes use a different indexing when
+                        # bookshelf_env_shift is set (offsets for environment
+                        # bodies). Handle both conventions and mark contacts
+                        # symmetrically.
                         if self.bookshelf_env_shift > 0:
                             if data['contact'][time_step][contact_i]['body0'] > 0 and data['contact'][time_step][contact_i]['body0'] < total_objects + 1 and data['contact'][time_step][contact_i]['body1'] > 0 and data['contact'][time_step][contact_i]['body1'] < total_objects + 1:
                                 contact_array[data['contact'][time_step][contact_i]['body0'] - 1, data['contact'][time_step][contact_i]['body1'] - 1] = 1
@@ -279,6 +319,11 @@ class PerSceneLoader(object):
                         current_block = "block_0" + str(each_obj + 1)
                     else:
                         current_block = "block_" + str(each_obj + 1)
+                    # Compute an axis-aligned initial bounding box (8 corners)
+                    # for each object based on its extents and position. We also
+                    # compute transformation matrices that move between object
+                    # frames and world frame. These are used below to build
+                    # rotated bounding boxes and final per-time-step extents.
                     initial_bounding_box = []
                     TF_matrix = []
                     for inner_i in range(2):
@@ -301,6 +346,10 @@ class PerSceneLoader(object):
                     
                     initial_bounding_box = np.array(initial_bounding_box)
                     
+                    # Rotate bounding box corners using object's orientation at
+                    # the first recorded pose to get corner coordinates in a
+                    # consistent frame. TF_rotated_bounding_matrix stores the
+                    # corner points as homogeneous coordinates for later use.
                     rotated_bounding_box = np.zeros((initial_bounding_box.shape[0], initial_bounding_box.shape[1], initial_bounding_box.shape[2]))
                     TF_rotated_bounding_matrix = []
                     
@@ -310,6 +359,10 @@ class PerSceneLoader(object):
                     
                     self.all_rotated_bounding_box[i_index].append(np.array(TF_rotated_bounding_matrix))
 
+                    # final_bounding_box/final_array contain the world-frame
+                    # coordinates of the 8 bounding box corners at the sampled
+                    # time-step. We use these to compute axis-wise max/min and
+                    # object extents which feed into relation predicates.
                     final_bounding_box = np.zeros((initial_bounding_box.shape[0], initial_bounding_box.shape[1], initial_bounding_box.shape[2]))
                     final_array = np.zeros((initial_bounding_box.shape[0], 3))
                     if True:
@@ -320,6 +373,10 @@ class PerSceneLoader(object):
                         
                       
 
+                    # Store computed bounding boxes and extents for this
+                    # object / timestep. These lists are later used to build
+                    # relation predicates (left/right/above/below/front/behind)
+                    # and to provide ground-truth target poses.
                     self.all_bounding_box[i_index].append(final_array)
                     
                     max_current_pose = np.max(final_array, axis = 0)[:3]
@@ -343,83 +400,96 @@ class PerSceneLoader(object):
 
                     self.all_obj_boundary_list[i_index].append(max_current_pose - min_current_pose)
 
+                    # Append a fixed-size sampled point-cloud for this object.
+                    # The dataset stores both noisy and noise-free samples; the
+                    # flag controls which is used. The downstream encoder expects
+                    # point clouds of a consistent size (data_size).
                     if self.add_noise_pc:
                         self.all_point_cloud[i_index].append(data[point_string + str(j+1) + 'sampling_noise'][i][:data_size, :])
                     else:
                         self.all_point_cloud[i_index].append(data[point_string + str(j+1) + 'sampling'][i][:data_size, :])
             
                     
+                    # Store a representative center point for the object's
+                    # sampled cloud. This is a simple geometric center and is
+                    # used in some relational computations instead of the full
+                    # bounding box when memory or speed is needed.
                     self.all_pos_list[i_index].append(self.get_point_cloud_center(data[point_string + str(j+1) + 'sampling'][i])) ## consider the case with memory
                         
                     
-                    if True:
-                        if True:
-                            identity_max_objects = 10
-                            rgb_identity_max = 10
-                            env_identity_max = 2
-                            current_identity_list = []
-                            rgb_identity_list = []
-                            if each_obj >= 3:
-                                current_identity_list = [1,0,0,0,0,0,0,0,0,0]
+                    identity_max_objects = 10
+                    rgb_identity_max = 10
+                    env_identity_max = 2
+                    current_identity_list = []
+                    rgb_identity_list = []
+                    if each_obj >= 3:
+                        current_identity_list = [1,0,0,0,0,0,0,0,0,0]
+                    else:
+                        for object_identity_id in range(identity_max_objects):
+                            if object_identity_id == each_obj:
+                                current_identity_list.append(1)
                             else:
-                                for object_identity_id in range(identity_max_objects):
-                                    if object_identity_id == each_obj:
-                                        current_identity_list.append(1)
-                                    else:
-                                        current_identity_list.append(0)
+                                current_identity_list.append(0)
+                        
+                    
+                    for rgb_identity_id in range(rgb_identity_max):
+                        if rgb_identity_id == each_obj:
+                            rgb_identity_list.append(1)
+                        else:
+                            rgb_identity_list.append(0)
+
+                    # Build environment / object identity encodings used by
+                    # the model to disambiguate object roles. There are many
+                    # experimental variants (one-bit env, separate env ids,
+                    # drawer special-casing). The intent is to provide a
+                    # fixed-size vector per object indicating whether it's
+                    # an environment/static body or a movable object and to
+                    # inject simple object identity when experiments need it.
+                    if self.one_bit_env:
+                        if self.seperate_env_id:
+                            if self.select_obj_num_range[each_obj] < (max_objects - self.max_env_num):
+                                env_identity_list = [0]
+                            else:
+                                env_identity_list = [1]
+                        else:
+                            if self.open_close_drawer:
                                 
-                            
-                            for rgb_identity_id in range(rgb_identity_max):
-                                if rgb_identity_id == each_obj:
-                                    rgb_identity_list.append(1)
-                                else:
-                                    rgb_identity_list.append(0)
-
-                            if self.one_bit_env:
-                                if self.seperate_env_id:
-                                    if self.select_obj_num_range[each_obj] < (max_objects - self.max_env_num):
-                                        env_identity_list = [0]
+                                if attrs['objects'][current_block]['object_type'] == 'urdf' and 'drawer' in attrs['objects'][current_block]['asset_filename']:
+                                    ## yixuan note here, always assume drawer is closed
+                                    if np.abs(data['objects'][current_block]['position'][self.sample_time_step[i]][0] - data['objects'][current_block]['position'][0][0]) > 0.02:
+                                        env_identity_list = [0, 1, 0]
                                     else:
-                                        env_identity_list = [1]
+                                        # env_identity_list = [0, 1, 1]
+                                        env_identity_list = [0, 0, 1]
+                                elif attrs['objects'][current_block]['fix_base_link']:
+                                    env_identity_list = [0, 0, 0]
                                 else:
-                                    if self.open_close_drawer:
-                                        
-                                        if attrs['objects'][current_block]['object_type'] == 'urdf' and 'drawer' in attrs['objects'][current_block]['asset_filename']:
-                                            ## yixuan note here, always assume drawer is closed
-                                            if np.abs(data['objects'][current_block]['position'][self.sample_time_step[i]][0] - data['objects'][current_block]['position'][0][0]) > 0.02:
-                                                env_identity_list = [0, 1, 0]
-                                            else:
-                                                # env_identity_list = [0, 1, 1]
-                                                env_identity_list = [0, 0, 1]
-                                        elif attrs['objects'][current_block]['fix_base_link']:
-                                            env_identity_list = [0, 0, 0]
-                                        else:
-                                            env_identity_list = [1, 0, 0]
-                                    else:
-                                        # if self.get_hidden_label and data['hidden_label'][i][each_obj] == 1:
-                                        #     env_identity_list = [0] ## this does not work since it's hard to determine based on a partial view point cloud
-                                        if attrs['objects'][current_block]['fix_base_link']:
-                                            env_identity_list = [0]
-                                        else:
-                                            env_identity_list = [1]
+                                    env_identity_list = [1, 0, 0]
                             else:
-                                if self.seperate_env_id:
-                                    if self.select_obj_num_range[each_obj] < (max_objects - self.max_env_num):
-                                        env_identity_list = [0,1]
-                                    else:
-                                        env_identity_list = [1,0]
+                                # if self.get_hidden_label and data['hidden_label'][i][each_obj] == 1:
+                                #     env_identity_list = [0] ## this does not work since it's hard to determine based on a partial view point cloud
+                                if attrs['objects'][current_block]['fix_base_link']:
+                                    env_identity_list = [0]
                                 else:
-                                    if attrs['objects']['block_'+str(each_obj+1)]['fix_base_link']:
-                                        env_identity_list = [0,1]
-                                    else:
-                                        env_identity_list = [1,0]
+                                    env_identity_list = [1]
+                    else:
+                        if self.seperate_env_id:
+                            if self.select_obj_num_range[each_obj] < (max_objects - self.max_env_num):
+                                env_identity_list = [0,1]
+                            else:
+                                env_identity_list = [1,0]
+                        else:
+                            if attrs['objects']['block_'+str(each_obj+1)]['fix_base_link']:
+                                env_identity_list = [0,1]
+                            else:
+                                env_identity_list = [1,0]
 
-                            
-                            self.all_rgb_identity_list[i_index].append(rgb_identity_list)
-                            self.all_gt_identity_list[i_index].append(current_identity_list)
-                            self.all_gt_env_identity_list[i_index].append(env_identity_list)
-                            self.all_gt_pose_list[i_index].append(data['objects'][current_block]['position'][self.sample_time_step[i]])
-                            self.all_gt_orientation_list[i_index].append(data['objects'][current_block]['orientation'][self.sample_time_step[i]])
+                    
+                    self.all_rgb_identity_list[i_index].append(rgb_identity_list)
+                    self.all_gt_identity_list[i_index].append(current_identity_list)
+                    self.all_gt_env_identity_list[i_index].append(env_identity_list)
+                    self.all_gt_pose_list[i_index].append(data['objects'][current_block]['position'][self.sample_time_step[i]])
+                    self.all_gt_orientation_list[i_index].append(data['objects'][current_block]['orientation'][self.sample_time_step[i]])
                         
 
                 if self.get_hidden_label:
@@ -432,10 +502,9 @@ class PerSceneLoader(object):
                 
                 for obj_pair in self.obj_pair_list:
                     (anchor_idx, other_idx) = obj_pair
-                    if True:
-                        self.all_relation_list[i_index].append(self.get_predicates(contact_array, anchor_idx, other_idx ,self.all_axis_bounding_box[i_index][anchor_idx], self.all_gt_pose_list[i_index][anchor_idx], self.all_gt_max_pose_list[i_index][anchor_idx], self.all_gt_min_pose_list[i_index][anchor_idx], self.all_gt_extents_list[anchor_idx], self.all_axis_bounding_box[i_index][other_idx], self.all_gt_pose_list[i_index][other_idx], self.all_gt_max_pose_list[i_index][other_idx],self.all_gt_min_pose_list[i_index][other_idx][:], self.all_gt_extents_list[other_idx])[:])
-                        if self.binary_grasp:
-                            self.all_gt_grapable_list[i_index].append(self.get_constrained_predicates(contact_array, anchor_idx, other_idx ,self.all_axis_bounding_box[i_index][anchor_idx], self.all_gt_pose_list[i_index][anchor_idx], self.all_gt_max_pose_list[i_index][anchor_idx], self.all_gt_min_pose_list[i_index][anchor_idx], self.all_gt_extents_list[anchor_idx], self.all_axis_bounding_box[i_index][other_idx], self.all_gt_pose_list[i_index][other_idx], self.all_gt_max_pose_list[i_index][other_idx],self.all_gt_min_pose_list[i_index][other_idx][:], self.all_gt_extents_list[other_idx])[:])
+                    self.all_relation_list[i_index].append(self.get_predicates(contact_array, anchor_idx, other_idx ,self.all_axis_bounding_box[i_index][anchor_idx], self.all_gt_pose_list[i_index][anchor_idx], self.all_gt_max_pose_list[i_index][anchor_idx], self.all_gt_min_pose_list[i_index][anchor_idx], self.all_gt_extents_list[anchor_idx], self.all_axis_bounding_box[i_index][other_idx], self.all_gt_pose_list[i_index][other_idx], self.all_gt_max_pose_list[i_index][other_idx],self.all_gt_min_pose_list[i_index][other_idx][:], self.all_gt_extents_list[other_idx])[:])
+                    if self.binary_grasp:
+                        self.all_gt_grapable_list[i_index].append(self.get_constrained_predicates(contact_array, anchor_idx, other_idx ,self.all_axis_bounding_box[i_index][anchor_idx], self.all_gt_pose_list[i_index][anchor_idx], self.all_gt_max_pose_list[i_index][anchor_idx], self.all_gt_min_pose_list[i_index][anchor_idx], self.all_gt_extents_list[anchor_idx], self.all_axis_bounding_box[i_index][other_idx], self.all_gt_pose_list[i_index][other_idx], self.all_gt_max_pose_list[i_index][other_idx],self.all_gt_min_pose_list[i_index][other_idx][:], self.all_gt_extents_list[other_idx])[:])
                 
                 min_value = 100
                 for each_pose_id in range(len(self.all_gt_pose_list[i_index]) - 2):
@@ -905,15 +974,11 @@ class PerSceneLoader(object):
 
     
     def compute_left_right_predicates(self, o1_predicate_args, o2_predicate_args, predicates):
-        """ Compute left-right predicates.
-            Use camera frame coordinates.
-            Relation rules:
-                1) o1 center MUST be in half-space defined by o2 UPPER corner and theta (xz plane)
-                2) o1 center MUST be in half-space defined by o2 LOWER corner and theta (xz plane)
-                3) do same as 1) for xy
-                4) do same as 2) for xy
-                5) o1 center MUST be to left of all o2 corners
-                6) All o1 corners MUST be to the left of o2 center
+        """Compute left/right binary relation between two objects.
+
+        Appends two binary entries to `predicates`: [o1_left_of_o2, o2_left_of_o1]
+        using camera-frame bounding box corners. The internal rules use a set
+        of half-space tests and corner comparisons to robustly decide left/right.
         """
 
         def left_of(cf_o1_bbox_corners, cf_o2_bbox_corners):
@@ -992,15 +1057,11 @@ class PerSceneLoader(object):
 
 
     def compute_block_only_predicates(self, o1_predicate_args, o2_predicate_args, predicates):
-        """ Compute left-right predicates.
-            Use camera frame coordinates.
-            Relation rules:
-                1) o1 center MUST be in half-space defined by o2 UPPER corner and theta (xz plane)
-                2) o1 center MUST be in half-space defined by o2 LOWER corner and theta (xz plane)
-                3) do same as 1) for xy
-                4) do same as 2) for xy
-                5) o1 center MUST be to left of all o2 corners
-                6) All o1 corners MUST be to the left of o2 center
+        """Variant of left/right predicate tuned for block-shaped objects.
+
+        Uses a different angular threshold (self.params['block_theta']) and
+        appends a single binary indicator for right/left depending on the
+        calling convention in the code.
         """
 
         def left_of(cf_o1_bbox_corners, cf_o2_bbox_corners):
@@ -1079,15 +1140,10 @@ class PerSceneLoader(object):
 
     
     def compute_right_only_predicates(self, o1_predicate_args, o2_predicate_args, predicates):
-        """ Compute left-right predicates.
-            Use camera frame coordinates.
-            Relation rules:
-                1) o1 center MUST be in half-space defined by o2 UPPER corner and theta (xz plane)
-                2) o1 center MUST be in half-space defined by o2 LOWER corner and theta (xz plane)
-                3) do same as 1) for xy
-                4) do same as 2) for xy
-                5) o1 center MUST be to left of all o2 corners
-                6) All o1 corners MUST be to the left of o2 center
+        """Another left/right helper which appends only the 'right' flag.
+
+        Kept for historical experiment variants where only a single
+        direction label (right) was required.
         """
 
         def left_of(cf_o1_bbox_corners, cf_o2_bbox_corners):
@@ -1608,6 +1664,8 @@ class DataLoader(object):
                             idx_to_data_dict[demo_idx]['att_objects'] = attrs['objects']
 
                             idx_to_data_dict[demo_idx]['goal_relations'] = self.current_goal_relations
+
+                            print('current goal relations:', self.current_goal_relations)
                             idx_to_data_dict[demo_idx]['predicted_relations'] = self.current_predicted_relations
                             idx_to_data_dict[demo_idx]['index_i'] = self.current_index_i
                             idx_to_data_dict[demo_idx]['index_j'] = self.current_index_j

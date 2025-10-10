@@ -36,12 +36,10 @@ def process_data(config, batch_data, push_3_steps = False):
     for b, data in enumerate(batch_data):
         x_dict['batch_num_objects'].append(data['num_objects'])
 
-        print("data['action']: ", data['action'].shape)
         x_dict['batch_action'].append(data['action'])
         x_dict['batch_all_obj_pair_relation'].append(data['relation'])
         x_dict['batch_one_hot_encoding'].append(data['one_hot_encoding'])
 
-        print("data['all_action_label']: ", data['all_action_label'].shape)
         x_dict['batch_skill_label'].append(data['all_action_label'])
         x_dict['batch_voxel_list_single'].append(data['all_object_pair_voxels_single'])
         x_dict['batch_env_identity'].append(data['env_identity'])
